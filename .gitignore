@@ -1,0 +1,12 @@
+build*/
+*.dll
+*.exe
+*.lib
+*.exp
+*.obj
+*.pdb
+*.log
+*.csv
+*.state
+FieldBossesState.ini
+.vs/

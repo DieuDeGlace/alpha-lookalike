@@ -113,3 +113,5 @@ EXPORT GenericMod*MakeMod(){return new AlphaLookalike();}
 EXPORT void ModPreInitialize(){}
 EXPORT int ModMajorVersion(){return 7;}
 EXPORT int ModMinorVersion(){return 3;}
+
+extern "C" __declspec(dllexport) void WINAPI FinishAlphaLookalike(){palette::apply();}

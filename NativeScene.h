@@ -1,23 +1,39 @@
 #pragma once
+// Shared helpers for reading Cube World (Steam, 64-bit) scene data through the
+// CWSDK headers. The same file is used by every Steam mod in this collection.
 #include "cube/Game.h"
 #include "gfx/ChunkBuffer.h"
 #include "gfx/D3D11VertexBuffer.h"
 #include <unordered_map>
 #include <cmath>
 namespace nativeScene {
+
+// Identity of the one supported cubeworld.exe build (PE timestamp and image size).
+constexpr DWORD SUPPORTED_TIMESTAMP = 0x5d93ab0d;
+constexpr DWORD SUPPORTED_IMAGE_SIZE = 0x5b7000;
+// RVA of the global cube::Game pointer in that build.
+constexpr size_t GAME_POINTER_RVA = 0x551a80;
+// Offset of a chunk buffer's vertical chunk index (not described by CWSDK).
+constexpr size_t CHUNK_BUFFER_Z = 0x5c;
+
+// True when running inside the exact executable these offsets were verified for.
 inline bool supported() {
     auto base = (unsigned char *)GetModuleHandleW(nullptr);
     auto dos = (IMAGE_DOS_HEADER *)base;
     if (dos->e_magic != IMAGE_DOS_SIGNATURE)
         return false;
     auto nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
-    return nt->Signature == IMAGE_NT_SIGNATURE && nt->FileHeader.TimeDateStamp == 0x5d93ab0d &&
-           nt->OptionalHeader.SizeOfImage == 0x5b7000;
+    return nt->Signature == IMAGE_NT_SIGNATURE &&
+           nt->FileHeader.TimeDateStamp == SUPPORTED_TIMESTAMP &&
+           nt->OptionalHeader.SizeOfImage == SUPPORTED_IMAGE_SIZE;
 }
+// The game object, or nullptr on an unsupported build.
 inline cube::Game *game() {
-    return supported() ? *(cube::Game **)((unsigned char *)GetModuleHandleW(nullptr) + 0x551a80)
-                       : nullptr;
+    return supported()
+               ? *(cube::Game **)((unsigned char *)GetModuleHandleW(nullptr) + GAME_POINTER_RVA)
+               : nullptr;
 }
+// True when `buffer` is the vertex buffer of the cloud or dark-cloud sprite.
 inline bool cloud(cube::World *world, ID3D11Buffer *buffer) {
     if (!world || !world->spritemanager || !buffer)
         return false;
@@ -34,21 +50,26 @@ inline bool cloud(cube::World *world, ID3D11Buffer *buffer) {
     }
     return false;
 }
+
+// Where a terrain chunk buffer lives: its zone and vertical chunk index.
 struct Chunk {
     IntVector2 zone;
     int z;
 };
+// GUIDs used with ID3D11Buffer::SetPrivateData to tag buffers between mods.
 inline const GUID chunkTagGuid = {
     0x2b4f651e, 0x5a85, 0x4ee7, {0xb3, 0x5a, 0xe8, 0x39, 0x14, 0xc4, 0x43, 0x55}};
 inline const GUID animatedGuid = {
     0x6d0d6559, 0xad22, 0x410f, {0xa7, 0xc3, 0xc3, 0x79, 0x10, 0x18, 0xbb, 0x6c}};
 inline const GUID cloudDriftGuid = {
     0x2a7e9811, 0x9041, 0x4895, {0x81, 0x56, 0x2e, 0x49, 0x17, 0xc3, 0x66, 0x09}};
+// Payload stored under chunkTagGuid on a replacement buffer.
 struct ChunkTag {
     ID3D11Buffer *original;
     Chunk info;
 };
 using Chunks = std::unordered_map<ID3D11Buffer *, Chunk>;
+
 // Nonblocking locks prevent the graphics thread from waiting on generation.
 struct Locks {
     cube::World *world;
@@ -69,6 +90,9 @@ struct Locks {
         }
     }
 };
+
+// Collects the terrain chunk buffers of every zone within `radius` blocks of the
+// local player. Returns false (leaving `out` untouched) when the world is busy.
 inline bool snapshot(cube::World *w, Chunks &out, double radius) {
     Locks lock(w);
     if (!lock.held || !w->local_creature)
@@ -76,6 +100,7 @@ inline bool snapshot(cube::World *w, Chunks &out, double radius) {
     Chunks next;
     double px = w->local_creature->entity_data.position.x / 65536.,
            py = w->local_creature->entity_data.position.y / 65536.;
+    // Zones are 64x64 blocks.
     int cx = (int)std::floor(px / 64), cy = (int)std::floor(py / 64),
         steps = (int)std::ceil(radius / 64) + 1;
     for (int ix = -steps; ix <= steps; ix++)
@@ -86,6 +111,7 @@ inline bool snapshot(cube::World *w, Chunks &out, double radius) {
             auto zone = found->second;
             if (!zone)
                 continue;
+            // Distance from the player to the zone's rectangle.
             double x = double(zone->position.x) * 64, y = double(zone->position.y) * 64;
             double dx = std::max(x - px, std::max(px - (x + 64), 0.)),
                    dy = std::max(y - py, std::max(py - (y + 64), 0.));
@@ -96,13 +122,15 @@ inline bool snapshot(cube::World *w, Chunks &out, double radius) {
                     continue;
                 auto v = (gfx::D3D11VertexBuffer *)cb->vertex_buffer;
                 if (v->buffer)
-                    next.emplace(v->buffer,
-                                 Chunk{zone->position, *(int *)((unsigned char *)cb + 0x5c)});
+                    next.emplace(v->buffer, Chunk{zone->position,
+                                                  *(int *)((unsigned char *)cb + CHUNK_BUFFER_Z)});
             }
         }
     out.swap(next);
     return true;
 }
+
+// True if `buffer` is still the live buffer for chunk `info`; `result` receives its zone.
 inline bool resident(cube::World *w, const Chunk &info, ID3D11Buffer *buffer, cube::Zone *&result) {
     auto found = w->zones.find(info.zone);
     if (found == w->zones.end() || !found->second)
@@ -111,10 +139,12 @@ inline bool resident(cube::World *w, const Chunk &info, ID3D11Buffer *buffer, cu
     for (auto cb : result->chunk.chunkbuffers)
         if (cb && cb->vertex_buffer &&
             ((gfx::D3D11VertexBuffer *)cb->vertex_buffer)->buffer == buffer &&
-            *(int *)((unsigned char *)cb + 0x5c) == info.z)
+            *(int *)((unsigned char *)cb + CHUNK_BUFFER_Z) == info.z)
             return true;
     return false;
 }
+
+// Block type at zone-local (x, y, z); 0 (air) outside the zone or column.
 inline int blockType(cube::Zone *zone, int x, int y, int z) {
     if (x < 0 || x >= 64 || y < 0 || y >= 64)
         return 0;

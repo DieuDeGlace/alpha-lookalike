@@ -179,6 +179,64 @@ int main() {
         auto eased = run(projection[10] + projection[11] / z, false);
         for (int i = 0; i < 3; i++)
             assert(abs(eased[i] - graded[i]) <= 3 + int(.15f * 255 * amount)); // mostly old sky
+        // Opaque fog: beyond SolidPercent (70% of the 100-unit draw distance) a
+        // surface is pure fog colour, so culling it changes nothing visible.
+        palette::fogCull = true;
+        float zSolid = 85;
+        auto opaque = run(projection[10] + projection[11] / zSolid);
+        for (int i = 0; i < 3; i++)
+            assert(abs(opaque[i] - int(roundf(palette::fogColor[i] * 255))) <= 3);
+        // Between the end (55) and solid (70) the fog keeps rising towards opaque.
+        float zBetween = 62;
+        auto rising = run(projection[10] + projection[11] / zBetween);
+        float atEnd = palette::fogStrength;
+        for (int i = 0; i < 3; i++) {
+            float fogged = palette::fogColor[i] * 255;
+            float share = fabsf(rising[i] - graded[i]) / std::max(1.f, fabsf(fogged - graded[i]));
+            assert(fabsf(fogged - graded[i]) < 8 || share >= atEnd - .02f);
+        }
+        // Culling: native world draws wholly beyond the opaque fog are skipped.
+        {
+            const UINT sizes[6] = {64, 64, 64, 16, 320, 48};
+            ID3D11Buffer *buffers[6]{};
+            for (int i = 0; i < 6; i++) {
+                D3D11_BUFFER_DESC bd{sizes[i], D3D11_USAGE_DEFAULT, D3D11_BIND_CONSTANT_BUFFER};
+                assert(SUCCEEDED(d->CreateBuffer(&bd, nullptr, &buffers[i])));
+            }
+            float view[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+            buffers[1]->SetPrivateData(palette::cacheGuid, 64, view);
+            memcpy(palette::sceneProjection, projection, 64);
+            palette::projectionKnown = true;
+            float fog[7]{};
+            assert(palette::fogConstants(fog) && fabsf(fog[6] - 70) < .01f);
+            palette::solidDistance = fog[6];
+            palette::finished = false;
+            auto cull = [&](float scale, float z, float jitter = 0, bool ortho = false) {
+                float p[16];
+                memcpy(p, projection, 64);
+                p[2] += jitter;
+                if (ortho)
+                    p[15] = 1;
+                buffers[0]->SetPrivateData(palette::cacheGuid, 64, p);
+                float world[16] = {scale, 0, 0, 0, 0, scale, 0, 0, 0, 0, scale, z, 0, 0, 0, 1};
+                buffers[2]->SetPrivateData(palette::cacheGuid, 64, world);
+                c->VSSetConstantBuffers(0, 6, buffers);
+                return palette::culled(c);
+            };
+            assert(cull(.05f, 90));                  // a small model far beyond the fog
+            assert(!cull(.05f, 60));                 // ... and one inside it
+            assert(!cull(.05f, 66));                 // straddling the solid distance
+            assert(cull(.05f, 90, .0013f));          // TemporalAA-jittered projection
+            assert(!cull(.05f, 90, 0, true));        // never orthographic (UI) draws
+            assert(cull(1, 100));                    // a terrain chunk far away
+            assert(!cull(1, 10));                    // ... and a near one
+            palette::solidDistance = 0;
+            assert(!cull(.05f, 90));                 // culling off without opaque fog
+            ID3D11Buffer *none[6]{};
+            c->VSSetConstantBuffers(0, 6, none);
+            for (auto *b : buffers)
+                b->Release();
+        }
         // Without a projection or depth, fog is off and the grade is unchanged.
         palette::fogEnabled = true;
         palette::target = rt;

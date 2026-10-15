@@ -90,6 +90,12 @@ static bool enabled = true, internal = false, finished = false;
 static float saturation = .90f, cool = .04f;
 static bool fogEnabled = true;
 static float fogStart = .08f, fogEnd = .55f, fogStrength = .90f; // Fractions of draw distance.
+// Culling: fog is opaque at `fogSolid` (fraction of draw distance) and native
+// world draws wholly beyond it are skipped.
+static bool fogCull = true;
+static float fogSolid = .70f;
+static float solidDistance = 0; // this frame, in view units; 0 = no culling
+static unsigned culledDraws = 0, worldDraws = 0, cullFrames = 0;
 static float fogColor[3] = {40 / 255.f, 70 / 255.f, 150 / 255.f}; // When no sky is visible.
 static ID3D11Device *device = nullptr;
 static ID3D11DeviceContext *context = nullptr;
@@ -137,6 +143,7 @@ cbuffer Grade:register(b0){
     float4 fogColor;        // rgb: used when no sky pixel is visible.
     float4 depthToDistance; // Native projection P[10], P[11], P[14], P[15].
     float fogStart,fogEnd,skyHistoryValid,skyBlend;
+    float4 solid;           // x: distance where fog becomes opaque, y: 1 when used
 };
 Texture2D<float4> scene:register(t0);
 // The fog's sky colour: one texel, updated once per frame by skyPass.
@@ -206,14 +213,29 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
             // Linear view distance from the depth and the native projection.
             float distance=abs((depthToDistance.y-d*depthToDistance.w)/denominator);
             float amount=smoothstep(fogStart,fogEnd,distance)*fogStrength;
+            // With culling, the fog becomes opaque at solid.x, so anything that
+            // lies wholly beyond it is skipped without a visible change.
+            if(solid.y>.5)
+                amount=lerp(amount,1,saturate((distance-fogEnd)/max(solid.x-fogEnd,1e-3)));
             c=lerp(c,skyHistory.Load(int3(0,0,0)).rgb,amount);
         }
     }
     return float4(c,original.a);
 })";
 
+static bool fogConstants(float *out);
 // Called once per presented frame.
 static void reset() {
+    if (++cullFrames % 3600 == 0 && worldDraws) {
+        char s[160];
+        sprintf_s(s, "Fog culling: %.1f%% of world draws skipped beyond the opaque fog (%u of %u "
+                     "over 3600 frames).",
+                  100. * culledDraws / worldDraws, culledDraws, worldDraws);
+        log(s);
+        culledDraws = worldDraws = 0;
+    }
+    float fog[7]{};
+    solidDistance = fogConstants(fog) ? fog[6] : 0;
     drop(target);
     drop(sceneDepth);
     projectionKnown = false;
@@ -266,7 +288,7 @@ static bool initialize(ID3D11DeviceContext *c) {
              SUCCEEDED(device->CreateShaderResourceView(skyTexture[i], nullptr, &skyView[i])) &&
              SUCCEEDED(device->CreateRenderTargetView(skyTexture[i], nullptr, &skyTarget[i]));
     D3D11_BUFFER_DESC cb{};
-    cb.ByteWidth = 64;
+    cb.ByteWidth = 80;
     cb.Usage = D3D11_USAGE_DEFAULT;
     cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (ok)
@@ -412,6 +434,8 @@ static bool fogConstants(float *out) {
     out[3] = p[15];
     out[4] = fogStart * drawDistance;
     out[5] = std::max(fogEnd * drawDistance, out[4] + 1e-3f);
+    // Opaque fog (and culling beyond it) only at full strength settings that reach it.
+    out[6] = fogCull ? std::max(fogSolid * drawDistance, out[5] + 1e-3f) : 0;
     return true;
 }
 
@@ -457,12 +481,13 @@ static bool apply() {
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context->IASetInputLayout(nullptr);
     context->VSSetShader(vs, nullptr, 0);
-    float fog[6]{};
+    float fog[7]{};
     bool fogged = fogConstants(fog) && copyDepth(td.Width, td.Height);
-    float values[16] = {saturation, cool, fogged ? 1.f : 0.f, fogStrength,
+    float values[20] = {saturation, cool, fogged ? 1.f : 0.f, fogStrength,
                         fogColor[0], fogColor[1], fogColor[2], 1,
                         fog[0], fog[1], fog[2], fog[3],
-                        fog[4], fog[5], skyValid ? 1.f : 0.f, SKY_BLEND};
+                        fog[4], fog[5], skyValid ? 1.f : 0.f, SKY_BLEND,
+                        fog[6], fog[6] > 0 ? 1.f : 0.f, 0, 0};
     context->UpdateSubresource(params, 0, nullptr, values, 0, 0);
     context->PSSetConstantBuffers(0, 1, &params);
     ID3D11ShaderResourceView *empty[3] = {};
@@ -564,16 +589,64 @@ static void before(ID3D11DeviceContext *c) {
     }
 }
 
+// True for a native world draw that lies wholly beyond the opaque fog: every
+// pixel it would cover would be pure fog colour, so it is skipped. Uses a
+// conservative bounding sphere: 78 blocks around a terrain chunk's centre (unit
+// world scale), 128 voxels around the model's centre for models.
+static bool culled(ID3D11DeviceContext *c) {
+    if (solidDistance <= 0 || internal || finished || !hasNativeWorldBuffers(c))
+        return false;
+    ID3D11Buffer *b[3]{};
+    c->VSGetConstantBuffers(0, 3, b);
+    float projection[16], view[16], world[16];
+    bool known = readBuffer(b[0], projection, 64) && readBuffer(b[1], view, 64) &&
+                 readBuffer(b[2], world, 64);
+    for (auto *x : b)
+        drop(x);
+    // The world camera: perspective, same focal lengths and depth range as the
+    // scene (TemporalAA's jitter only changes the offset terms).
+    auto close = [](float a, float b) { return fabsf(a - b) <= 1e-4f * std::max(1.f, fabsf(b)); };
+    if (!known || fabsf(projection[15]) > .5f || !close(projection[0], sceneProjection[0]) ||
+        !close(projection[5], sceneProjection[5]) || !close(projection[10], sceneProjection[10]) ||
+        !close(projection[11], sceneProjection[11]) || !close(projection[14], sceneProjection[14]))
+        return false; // orthographic UI, previews, other views
+    float scale = 0;
+    for (int column = 0; column < 3; ++column)
+        scale = std::max(scale, sqrtf(world[column] * world[column] +
+                                      world[4 + column] * world[4 + column] +
+                                      world[8 + column] * world[8 + column]));
+    bool terrain = fabsf(scale - 1) < 1e-3f;
+    // Local centre and radius (native vertices span 0..255 units before world).
+    // Terrain: a 64x64-block zone column slice, kept tall (128) to be safe.
+    float localXY = terrain ? 32.f : 64.f, localZ = terrain ? 64.f : 64.f;
+    float radius = terrain ? 78.f : 111.f * scale;
+    float centre[3];
+    for (int r = 0; r < 3; ++r)
+        centre[r] = world[r * 4] * localXY + world[r * 4 + 1] * localXY +
+                    world[r * 4 + 2] * localZ + world[r * 4 + 3];
+    // Fog uses linear view depth, so the view-space z of the nearest point counts.
+    float z = view[8] * centre[0] + view[9] * centre[1] + view[10] * centre[2] + view[11];
+    ++worldDraws;
+    if (fabsf(z) - radius <= solidDistance)
+        return false;
+    ++culledDraws;
+    return true;
+}
+
 // ===========================================================================
 // Hooks
 // ===========================================================================
 
 static void STDMETHODCALLTYPE di(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
     before(c);
+    if (culled(c))
+        return;
     oldDI(c, n, s, b);
 }
 static void STDMETHODCALLTYPE draw(ID3D11DeviceContext *c, UINT n, UINT s) {
     before(c);
+    if (culled(c))
+        return;
     oldD(c, n, s);
 }
 // Map/Unmap/Update: remember writes to 64-byte constant buffers.
@@ -629,6 +702,8 @@ static void loadSettings() {
     fogStart = percent(L"StartPercent", 8, 100);
     fogEnd = std::max(percent(L"EndPercent", 55, 150), fogStart + .01f);
     fogStrength = percent(L"StrengthPercent", 90, 100);
+    fogCull = GetPrivateProfileIntW(L"Fog", L"Cull", 1, ini) != 0;
+    fogSolid = std::max(percent(L"SolidPercent", 70, 150), fogEnd + .01f);
     const wchar_t *channels[] = {L"ColorRed", L"ColorGreen", L"ColorBlue"};
     const int defaults[] = {40, 70, 150};
     for (int i = 0; i < 3; i++)

@@ -10,7 +10,10 @@ namespace nativeScene {
 
 // Identity of the one supported cubeworld.exe build (PE timestamp and image size).
 constexpr DWORD SUPPORTED_TIMESTAMP = 0x5d93ab0d;
-constexpr DWORD SUPPORTED_IMAGE_SIZE = 0x5b7000;
+// The same Steam build runs as 0x5b7000 bytes on PC (with its SteamStub .bind
+// section) and 0x58a000 on GameNative, where that section is stripped; code
+// and data RVAs are identical. Hook sites still check their own bytes.
+constexpr DWORD SUPPORTED_IMAGE_SIZE = 0x5b7000, GAMENATIVE_IMAGE_SIZE = 0x58a000;
 // RVA of the global cube::Game pointer in that build.
 constexpr size_t GAME_POINTER_RVA = 0x551a80;
 // Offset of a chunk buffer's vertical chunk index (not described by CWSDK).
@@ -25,7 +28,8 @@ inline bool supported() {
     auto nt = (IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
     return nt->Signature == IMAGE_NT_SIGNATURE &&
            nt->FileHeader.TimeDateStamp == SUPPORTED_TIMESTAMP &&
-           nt->OptionalHeader.SizeOfImage == SUPPORTED_IMAGE_SIZE;
+           (nt->OptionalHeader.SizeOfImage == SUPPORTED_IMAGE_SIZE ||
+            nt->OptionalHeader.SizeOfImage == GAMENATIVE_IMAGE_SIZE);
 }
 // The game object, or nullptr on an unsupported build.
 inline cube::Game *game() {

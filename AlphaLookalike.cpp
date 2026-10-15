@@ -103,6 +103,13 @@ static float sceneProjection[16]{};                  // Native projection of the
 static bool projectionKnown = false;
 static ID3D11Texture2D *depthCopy = nullptr; // Readable copy of the scene depth.
 static ID3D11ShaderResourceView *depthView = nullptr;
+// The scene depth itself when it is already shader-readable (ReShade, or
+// TemporalAA's readable-depth hook): read in place, no copy.
+static ID3D11Texture2D *depthSource = nullptr;
+static ID3D11ShaderResourceView *depthSourceView = nullptr;
+static ID3D11ShaderResourceView *depthInput = nullptr; // This frame's fog depth.
+static bool depthMultisampled = false;
+static ID3D11PixelShader *psMsaa = nullptr; // ps with MSAA_DEPTH.
 static DXGI_FORMAT depthFamily = DXGI_FORMAT_UNKNOWN;
 static D3D11_VIEWPORT viewport{};
 static ID3D11VertexShader *vs = nullptr;
@@ -123,7 +130,15 @@ cbuffer Grade:register(b0){
     float fogStart,fogEnd,pad0,pad1;
 };
 Texture2D<float4> scene:register(t0);
+// Scene depth: multisampled when the game renders with MSAA (sample 0 is
+// used; the grade reads the resolved colour), single-sample otherwise.
+#ifdef MSAA_DEPTH
+Texture2DMS<float> depth:register(t1);
+float depthAt(int2 q){return depth.Load(q,0);}
+#else
 Texture2D<float> depth:register(t1);
+float depthAt(int2 q){return depth.Load(int3(q,0));}
+#endif
 
 float4 vs(uint id:SV_VertexID):SV_POSITION{
     float2 p=float2((id<<1)&2,id&2);
@@ -153,7 +168,7 @@ float3 skyColor(uint w,uint h){
     float count=0;
     [unroll]for(int i=0;i<8;i++){
         int2 q=int2((i+.5)*w/8,h*((i&1)?.06:.16));
-        if(depth.Load(int3(q,0))>=.99999){
+        if(depthAt(q)>=.99999){
             sum+=grade(scene.Load(int3(q,0)).rgb);
             count+=1;
         }
@@ -164,7 +179,7 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
     float4 original=scene.Load(int3(p.xy,0));
     float3 c=grade(original.rgb);
     [branch]if(fog>.5){
-        float d=depth.Load(int3(p.xy,0));
+        float d=depthAt(int2(p.xy));
         float denominator=d*depthToDistance.z-depthToDistance.x;
         if(d<.99999&&abs(denominator)>1e-8){
             // Linear view distance from the depth and the native projection.
@@ -201,17 +216,21 @@ static bool initialize(ID3D11DeviceContext *c) {
         ok = SUCCEEDED(d1->CreateDeviceContextState(0, &level, 1, D3D11_SDK_VERSION,
                                                     __uuidof(ID3D11Device), nullptr, &state));
     drop(d1);
-    for (int i = 0; i < 2 && ok; i++) {
-        bool pixel = i == 1;
+    static const D3D_SHADER_MACRO msaaDepth[] = {{"MSAA_DEPTH", "1"}, {nullptr, nullptr}};
+    for (int i = 0; i < 3 && ok; i++) {
+        bool pixel = i > 0;
         ID3DBlob *b = nullptr, *error = nullptr;
-        ok = SUCCEEDED(D3DCompile(code, strlen(code), "NativePalette", nullptr, nullptr,
-                                  pixel ? "ps" : "vs", pixel ? "ps_4_0" : "vs_4_0",
+        // Texture2DMS loads need shader model 4.1.
+        ok = SUCCEEDED(D3DCompile(code, strlen(code), "NativePalette", i == 2 ? msaaDepth : nullptr,
+                                  nullptr, pixel ? "ps" : "vs",
+                                  i == 2 ? "ps_4_1" : pixel ? "ps_4_0" : "vs_4_0",
                                   D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &b, &error));
         if (error)
             log((char *)error->GetBufferPointer());
         if (ok)
             ok = SUCCEEDED(pixel ? device->CreatePixelShader(b->GetBufferPointer(),
-                                                             b->GetBufferSize(), nullptr, &ps)
+                                                             b->GetBufferSize(), nullptr,
+                                                             i == 1 ? &ps : &psMsaa)
                                  : device->CreateVertexShader(b->GetBufferPointer(),
                                                               b->GetBufferSize(), nullptr, &vs));
         drop(b);
@@ -255,9 +274,11 @@ static bool texture(ID3D11Texture2D *source, DXGI_FORMAT typed) {
            SUCCEEDED(device->CreateShaderResourceView(copy, nullptr, &view));
 }
 
-// Copies this frame's single-sample scene depth into a readable texture.
-// Unsupported layouts (MSAA, other sizes/formats) simply leave fog off.
+// Makes this frame's scene depth readable for the fog: in place when the depth
+// texture is shader-readable, otherwise a copy (single-sample or MSAA). Sets
+// depthInput/depthMultisampled. Unsupported sizes/formats leave fog off.
 static bool copyDepth(UINT w, UINT h) {
+    depthInput = nullptr;
     if (!sceneDepth)
         return false;
     ID3D11Resource *resource = nullptr;
@@ -294,25 +315,44 @@ static bool copyDepth(UINT w, UINT h) {
     default:
         break;
     }
-    if (typeless == DXGI_FORMAT_UNKNOWN || d.SampleDesc.Count != 1 || d.Width != w ||
-        d.Height != h || d.ArraySize != 1 || d.MipLevels != 1) {
+    if (typeless == DXGI_FORMAT_UNKNOWN || d.Width != w || d.Height != h || d.ArraySize != 1 ||
+        d.MipLevels != 1) {
         drop(source);
         return false;
+    }
+    depthMultisampled = d.SampleDesc.Count > 1;
+    D3D11_SHADER_RESOURCE_VIEW_DESC v{};
+    v.Format = readable;
+    v.ViewDimension =
+        depthMultisampled ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D;
+    v.Texture2D.MipLevels = 1;
+    if (d.BindFlags & D3D11_BIND_SHADER_RESOURCE) {
+        if (source != depthSource) {
+            drop(depthSourceView);
+            drop(depthSource);
+            if (FAILED(device->CreateShaderResourceView(source, &v, &depthSourceView))) {
+                drop(source);
+                return false;
+            }
+            depthSource = source;
+            source->AddRef();
+        }
+        depthInput = depthSourceView;
+        drop(source);
+        return true;
     }
     D3D11_TEXTURE2D_DESC existing{};
     if (depthCopy)
         depthCopy->GetDesc(&existing);
-    if (!depthCopy || existing.Width != w || existing.Height != h || depthFamily != typeless) {
+    if (!depthCopy || existing.Width != w || existing.Height != h || depthFamily != typeless ||
+        existing.SampleDesc.Count != d.SampleDesc.Count ||
+        existing.SampleDesc.Quality != d.SampleDesc.Quality) {
         drop(depthView);
         drop(depthCopy);
         d.Format = typeless;
         d.Usage = D3D11_USAGE_DEFAULT;
         d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         d.CPUAccessFlags = d.MiscFlags = 0;
-        D3D11_SHADER_RESOURCE_VIEW_DESC v{};
-        v.Format = readable;
-        v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        v.Texture2D.MipLevels = 1;
         if (FAILED(device->CreateTexture2D(&d, nullptr, &depthCopy)) ||
             FAILED(device->CreateShaderResourceView(depthCopy, &v, &depthView))) {
             drop(depthView);
@@ -323,6 +363,7 @@ static bool copyDepth(UINT w, UINT h) {
         depthFamily = typeless;
     }
     context->CopyResource(depthCopy, source);
+    depthInput = depthView;
     drop(source);
     return true;
 }
@@ -387,16 +428,16 @@ static bool apply() {
     context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     context->IASetInputLayout(nullptr);
     context->VSSetShader(vs, nullptr, 0);
-    context->PSSetShader(ps, nullptr, 0);
     float fog[6]{};
     bool fogged = fogConstants(fog) && copyDepth(td.Width, td.Height);
+    context->PSSetShader(fogged && depthMultisampled ? psMsaa : ps, nullptr, 0);
     float values[16] = {saturation, cool, fogged ? 1.f : 0.f, fogStrength,
                         fogColor[0], fogColor[1], fogColor[2], 1,
                         fog[0], fog[1], fog[2], fog[3],
                         fog[4], fog[5], 0, 0};
     context->UpdateSubresource(params, 0, nullptr, values, 0, 0);
     context->PSSetConstantBuffers(0, 1, &params);
-    ID3D11ShaderResourceView *inputs[2] = {view, fogged ? depthView : nullptr};
+    ID3D11ShaderResourceView *inputs[2] = {view, fogged ? depthInput : nullptr};
     context->PSSetShaderResources(0, 2, inputs);
     oldD(context, 3, 0); // Full-screen triangle.
     ID3D11ShaderResourceView *empty[2] = {};

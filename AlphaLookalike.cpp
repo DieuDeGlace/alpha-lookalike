@@ -110,6 +110,15 @@ static ID3D11ShaderResourceView *depthSourceView = nullptr;
 static ID3D11ShaderResourceView *depthInput = nullptr; // This frame's fog depth.
 static bool depthMultisampled = false;
 static ID3D11PixelShader *psMsaa = nullptr; // ps with MSAA_DEPTH.
+// Fog sky colour history: two 1x1 textures used alternately; skyPass reads one
+// and writes the other each fogged frame.
+static ID3D11PixelShader *skyPS = nullptr, *skyPSMsaa = nullptr;
+static ID3D11Texture2D *skyTexture[2] = {};
+static ID3D11ShaderResourceView *skyView[2] = {};
+static ID3D11RenderTargetView *skyTarget[2] = {};
+static int skyCurrent = 0;
+static bool skyValid = false;
+constexpr float SKY_BLEND = .15f; // share of the new sky colour per frame
 static DXGI_FORMAT depthFamily = DXGI_FORMAT_UNKNOWN;
 static D3D11_VIEWPORT viewport{};
 static ID3D11VertexShader *vs = nullptr;
@@ -127,9 +136,11 @@ cbuffer Grade:register(b0){
     float saturation,cool,fog,fogStrength;
     float4 fogColor;        // rgb: used when no sky pixel is visible.
     float4 depthToDistance; // Native projection P[10], P[11], P[14], P[15].
-    float fogStart,fogEnd,pad0,pad1;
+    float fogStart,fogEnd,skyHistoryValid,skyBlend;
 };
 Texture2D<float4> scene:register(t0);
+// The fog's sky colour: one texel, updated once per frame by skyPass.
+Texture2D<float4> skyHistory:register(t2);
 // Scene depth: multisampled when the game renders with MSAA (sample 0 is
 // used; the grade reads the resolved colour), single-sample otherwise.
 #ifdef MSAA_DEPTH
@@ -162,8 +173,14 @@ float3 grade(float3 original){
     return saturate(c);
 }
 // The graded colour of the visible sky (depth 1) along the top of the screen,
-// so fog matches day, night and weather; the configured colour otherwise.
-float3 skyColor(uint w,uint h){
+// so fog matches day, night and weather. Computed once per frame into a single
+// texel and eased over a few frames: the probe points flipping between sky and
+// terrain as the camera moves must not make the fog colour jump. When no sky
+// is visible the previous colour is kept (the configured colour until a sky
+// has been seen).
+float4 skyPass(float4 p:SV_POSITION):SV_TARGET{
+    uint w,h;
+    scene.GetDimensions(w,h);
     float3 sum=0;
     float count=0;
     [unroll]for(int i=0;i<8;i++){
@@ -173,7 +190,11 @@ float3 skyColor(uint w,uint h){
             count+=1;
         }
     }
-    return count>0?sum/count:fogColor.rgb;
+    float3 previous=skyHistoryValid>.5?skyHistory.Load(int3(0,0,0)).rgb:fogColor.rgb;
+    if(count==0)
+        return float4(previous,1);
+    float3 current=sum/count;
+    return float4(skyHistoryValid>.5?lerp(previous,current,skyBlend):current,1);
 }
 float4 ps(float4 p:SV_POSITION):SV_TARGET{
     float4 original=scene.Load(int3(p.xy,0));
@@ -185,9 +206,7 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
             // Linear view distance from the depth and the native projection.
             float distance=abs((depthToDistance.y-d*depthToDistance.w)/denominator);
             float amount=smoothstep(fogStart,fogEnd,distance)*fogStrength;
-            uint w,h;
-            scene.GetDimensions(w,h);
-            c=lerp(c,skyColor(w,h),amount);
+            c=lerp(c,skyHistory.Load(int3(0,0,0)).rgb,amount);
         }
     }
     return float4(c,original.a);
@@ -217,25 +236,35 @@ static bool initialize(ID3D11DeviceContext *c) {
                                                     __uuidof(ID3D11Device), nullptr, &state));
     drop(d1);
     static const D3D_SHADER_MACRO msaaDepth[] = {{"MSAA_DEPTH", "1"}, {nullptr, nullptr}};
-    for (int i = 0; i < 3 && ok; i++) {
-        bool pixel = i > 0;
+    for (int i = 0; i < 5 && ok; i++) {
+        bool pixel = i > 0, msaa = i == 2 || i == 4;
         ID3DBlob *b = nullptr, *error = nullptr;
         // Texture2DMS loads need shader model 4.1.
-        ok = SUCCEEDED(D3DCompile(code, strlen(code), "NativePalette", i == 2 ? msaaDepth : nullptr,
-                                  nullptr, pixel ? "ps" : "vs",
-                                  i == 2 ? "ps_4_1" : pixel ? "ps_4_0" : "vs_4_0",
+        ok = SUCCEEDED(D3DCompile(code, strlen(code), "NativePalette", msaa ? msaaDepth : nullptr,
+                                  nullptr, !pixel ? "vs" : i >= 3 ? "skyPass" : "ps",
+                                  msaa ? "ps_4_1" : pixel ? "ps_4_0" : "vs_4_0",
                                   D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &b, &error));
         if (error)
             log((char *)error->GetBufferPointer());
         if (ok)
             ok = SUCCEEDED(pixel ? device->CreatePixelShader(b->GetBufferPointer(),
                                                              b->GetBufferSize(), nullptr,
-                                                             i == 1 ? &ps : &psMsaa)
+                                                             i == 1   ? &ps
+                                                             : i == 2 ? &psMsaa
+                                                             : i == 3 ? &skyPS
+                                                                      : &skyPSMsaa)
                                  : device->CreateVertexShader(b->GetBufferPointer(),
                                                               b->GetBufferSize(), nullptr, &vs));
         drop(b);
         drop(error);
     }
+    D3D11_TEXTURE2D_DESC skyDesc{1, 1, 1, 1, DXGI_FORMAT_R16G16B16A16_FLOAT, {1, 0},
+                                 D3D11_USAGE_DEFAULT,
+                                 D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE};
+    for (int i = 0; i < 2 && ok; i++)
+        ok = SUCCEEDED(device->CreateTexture2D(&skyDesc, nullptr, &skyTexture[i])) &&
+             SUCCEEDED(device->CreateShaderResourceView(skyTexture[i], nullptr, &skyView[i])) &&
+             SUCCEEDED(device->CreateRenderTargetView(skyTexture[i], nullptr, &skyTarget[i]));
     D3D11_BUFFER_DESC cb{};
     cb.ByteWidth = 64;
     cb.Usage = D3D11_USAGE_DEFAULT;
@@ -430,18 +459,36 @@ static bool apply() {
     context->VSSetShader(vs, nullptr, 0);
     float fog[6]{};
     bool fogged = fogConstants(fog) && copyDepth(td.Width, td.Height);
-    context->PSSetShader(fogged && depthMultisampled ? psMsaa : ps, nullptr, 0);
     float values[16] = {saturation, cool, fogged ? 1.f : 0.f, fogStrength,
                         fogColor[0], fogColor[1], fogColor[2], 1,
                         fog[0], fog[1], fog[2], fog[3],
-                        fog[4], fog[5], 0, 0};
+                        fog[4], fog[5], skyValid ? 1.f : 0.f, SKY_BLEND};
     context->UpdateSubresource(params, 0, nullptr, values, 0, 0);
     context->PSSetConstantBuffers(0, 1, &params);
-    ID3D11ShaderResourceView *inputs[2] = {view, fogged ? depthInput : nullptr};
-    context->PSSetShaderResources(0, 2, inputs);
+    ID3D11ShaderResourceView *empty[3] = {};
+    if (fogged) {
+        // 1. Update the fog's sky colour (one texel) from this frame's sky.
+        int next = 1 - skyCurrent;
+        D3D11_VIEWPORT one{0, 0, 1, 1, 0, 1};
+        context->OMSetRenderTargets(1, &skyTarget[next], nullptr);
+        context->RSSetViewports(1, &one);
+        context->PSSetShader(depthMultisampled ? skyPSMsaa : skyPS, nullptr, 0);
+        ID3D11ShaderResourceView *skyInputs[3] = {view, depthInput, skyView[skyCurrent]};
+        context->PSSetShaderResources(0, 3, skyInputs);
+        oldD(context, 3, 0);
+        context->PSSetShaderResources(0, 3, empty);
+        skyCurrent = next;
+        skyValid = true;
+        context->OMSetRenderTargets(1, &target, nullptr);
+        context->RSSetViewports(1, &viewport);
+    }
+    // 2. Grade (and fog) the scene.
+    context->PSSetShader(fogged && depthMultisampled ? psMsaa : ps, nullptr, 0);
+    ID3D11ShaderResourceView *inputs[3] = {view, fogged ? depthInput : nullptr,
+                                           fogged ? skyView[skyCurrent] : nullptr};
+    context->PSSetShaderResources(0, 3, inputs);
     oldD(context, 3, 0); // Full-screen triangle.
-    ID3D11ShaderResourceView *empty[2] = {};
-    context->PSSetShaderResources(0, 2, empty);
+    context->PSSetShaderResources(0, 3, empty);
     context->OMSetRenderTargets(0, nullptr, nullptr);
     context1->SwapDeviceContextState(saved, nullptr);
     drop(saved);
@@ -646,6 +693,11 @@ class AlphaLookalike : public GenericMod {
         palette::attach();
     }
     void OnPresent(IDXGISwapChain *, UINT, UINT) override {
+        if (GetAsyncKeyState(VK_F6) & 1) {
+            palette::fogEnabled = !palette::fogEnabled;
+            palette::skyValid = false;
+            palette::log(palette::fogEnabled ? "Fog enabled (F6)." : "Fog disabled (F6).");
+        }
         palette::reset();
     }
 };

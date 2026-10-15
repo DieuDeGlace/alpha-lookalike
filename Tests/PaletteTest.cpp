@@ -113,7 +113,9 @@ int main() {
         projection[10] = f / (f - n);
         projection[11] = -n * f / (f - n);
         projection[14] = 1;
-        auto run = [&](float depthValue) {
+        auto run = [&](float depthValue, bool freshSky = true) {
+            if (freshSky)
+                palette::skyValid = false; // each case starts without sky history
             float color[] = {.8f, .2f, .1f, 1};
             c->ClearRenderTargetView(rt, color);
             c->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, depthValue, 0);
@@ -153,6 +155,30 @@ int main() {
             int expected = int(roundf(graded[i] + (palette::fogColor[i] * 255 - graded[i]) * amount));
             assert(abs(distant[i] - expected) <= 3);
         }
+        // Sky colour stability: after a frame with visible sky, frames without
+        // any sky keep that sky colour instead of jumping to the configured one,
+        // and a changed sky is eased in rather than switched in one frame.
+        run(1.f); // sky everywhere: the scene's graded colour becomes the sky colour
+        auto kept = run(projection[10] + projection[11] / z, false);
+        for (int i = 0; i < 3; i++)
+            assert(abs(kept[i] - graded[i]) <= 3); // fog towards the kept sky (= graded)
+        palette::skyValid = false;
+        run(1.f);
+        float otherColor[] = {.1f, .3f, .9f, 1};
+        c->ClearRenderTargetView(rt, otherColor);
+        c->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, 1, 0);
+        palette::target = rt;
+        rt->AddRef();
+        palette::sceneDepth = dsv;
+        dsv->AddRef();
+        palette::finished = false;
+        c->OMSetRenderTargets(1, &rt, nullptr);
+        assert(palette::apply()); // a differently coloured sky: eased 15% this frame
+        palette::drop(palette::sceneDepth);
+        c->OMSetRenderTargets(0, nullptr, nullptr);
+        auto eased = run(projection[10] + projection[11] / z, false);
+        for (int i = 0; i < 3; i++)
+            assert(abs(eased[i] - graded[i]) <= 3 + int(.15f * 255 * amount)); // mostly old sky
         // Without a projection or depth, fog is off and the grade is unchanged.
         palette::fogEnabled = true;
         palette::target = rt;
@@ -212,6 +238,7 @@ int main() {
             dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
             assert(SUCCEEDED(d->CreateDepthStencilView(depthTexture, &dv, &dsv)));
             auto run = [&](float depthValue, bool fogOn) {
+                palette::skyValid = false;
                 float color[] = {.8f, .2f, .1f, 1};
                 c->ClearRenderTargetView(rt, color);
                 c->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, depthValue, 0);

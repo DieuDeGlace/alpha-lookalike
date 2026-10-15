@@ -89,7 +89,7 @@ static bool enabled = true, internal = false, finished = false;
 // Settings (see alpha-lookalike.ini).
 static float saturation = .90f, cool = .04f;
 static bool fogEnabled = true;
-static float fogStart = .35f, fogEnd = 1.f, fogStrength = .85f; // Fractions of draw distance.
+static float fogStart = .08f, fogEnd = .55f, fogStrength = .90f; // Fractions of draw distance.
 static float fogColor[3] = {40 / 255.f, 70 / 255.f, 150 / 255.f}; // When no sky is visible.
 static ID3D11Device *device = nullptr;
 static ID3D11DeviceContext *context = nullptr;
@@ -538,9 +538,9 @@ static void loadSettings() {
         return std::clamp((int)GetPrivateProfileIntW(L"Fog", name, fallback, ini), 0, high) * .01f;
     };
     fogEnabled = GetPrivateProfileIntW(L"Fog", L"Enabled", 1, ini) != 0;
-    fogStart = percent(L"StartPercent", 35, 100);
-    fogEnd = std::max(percent(L"EndPercent", 100, 150), fogStart + .01f);
-    fogStrength = percent(L"StrengthPercent", 85, 100);
+    fogStart = percent(L"StartPercent", 8, 100);
+    fogEnd = std::max(percent(L"EndPercent", 55, 150), fogStart + .01f);
+    fogStrength = percent(L"StrengthPercent", 90, 100);
     const wchar_t *channels[] = {L"ColorRed", L"ColorGreen", L"ColorBlue"};
     const int defaults[] = {40, 70, 150};
     for (int i = 0; i < 3; i++)

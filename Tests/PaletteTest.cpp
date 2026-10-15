@@ -142,12 +142,12 @@ int main() {
         palette::fogEnabled = true;
         // Sky (depth 1) is never fogged.
         assert(run(1.f) == graded);
-        // Near (2 units) stays clear; 80 units blends toward the fog colour.
+        // Near (2 units) stays clear; 30 units blends toward the fog colour.
         float z = 2;
         assert(run(projection[10] + projection[11] / z) == graded);
-        z = 80;
+        z = 30;
         auto distant = run(projection[10] + projection[11] / z);
-        float s = (z - .35f * f) / (f - .35f * f);
+        float s = (z - palette::fogStart * f) / ((palette::fogEnd - palette::fogStart) * f);
         float amount = s * s * (3 - 2 * s) * palette::fogStrength;
         for (int i = 0; i < 3; i++) {
             int expected = int(roundf(graded[i] + (palette::fogColor[i] * 255 - graded[i]) * amount));

@@ -1,6 +1,7 @@
 #include "../AlphaLookalike.cpp"
 #include <cassert>
 #include <cstdio>
+#include <array>
 int main() {
     ID3D11Device *d = nullptr;
     ID3D11DeviceContext *c = nullptr;
@@ -79,6 +80,95 @@ int main() {
         palette::drop(t);
         printf("Palette colors, state restoration and target release: %ux%u PASS\n", size.first,
                size.second);
+    }
+    {
+        // Distance fog: a standard perspective (near 0.5, far 100) and a depth
+        // buffer cleared to a known distance.
+        const UINT w = 640, h = 360;
+        ID3D11Texture2D *t = nullptr, *readback = nullptr, *depthTexture = nullptr;
+        ID3D11RenderTargetView *rt = nullptr;
+        ID3D11DepthStencilView *dsv = nullptr;
+        D3D11_TEXTURE2D_DESC td{};
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET;
+        assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &t)));
+        assert(SUCCEEDED(d->CreateRenderTargetView(t, nullptr, &rt)));
+        td.BindFlags = 0;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &readback)));
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.CPUAccessFlags = 0;
+        td.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+        assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &depthTexture)));
+        assert(SUCCEEDED(d->CreateDepthStencilView(depthTexture, nullptr, &dsv)));
+        const float n = .5f, f = 100.f;
+        float projection[16]{};
+        projection[0] = projection[5] = 1;
+        projection[10] = f / (f - n);
+        projection[11] = -n * f / (f - n);
+        projection[14] = 1;
+        auto run = [&](float depthValue) {
+            float color[] = {.8f, .2f, .1f, 1};
+            c->ClearRenderTargetView(rt, color);
+            c->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, depthValue, 0);
+            palette::target = rt;
+            rt->AddRef();
+            palette::sceneDepth = dsv;
+            dsv->AddRef();
+            memcpy(palette::sceneProjection, projection, 64);
+            palette::projectionKnown = true;
+            palette::viewport = {0, 0, (float)w, (float)h, 0, 1};
+            palette::finished = false;
+            c->OMSetRenderTargets(1, &rt, nullptr);
+            assert(palette::apply());
+            palette::drop(palette::sceneDepth);
+            c->OMSetRenderTargets(0, nullptr, nullptr);
+            c->CopyResource(readback, t);
+            D3D11_MAPPED_SUBRESOURCE map{};
+            assert(SUCCEEDED(c->Map(readback, 0, D3D11_MAP_READ, 0, &map)));
+            auto pixel = (unsigned char *)map.pData + (h / 2) * map.RowPitch + (w / 2) * 4;
+            int rgb[3] = {pixel[0], pixel[1], pixel[2]};
+            c->Unmap(readback, 0);
+            return std::array<int, 3>{rgb[0], rgb[1], rgb[2]};
+        };
+        palette::fogEnabled = false;
+        auto graded = run(.5f);
+        palette::fogEnabled = true;
+        // Sky (depth 1) is never fogged.
+        assert(run(1.f) == graded);
+        // Near (2 units) stays clear; 80 units blends toward the fog colour.
+        float z = 2;
+        assert(run(projection[10] + projection[11] / z) == graded);
+        z = 80;
+        auto distant = run(projection[10] + projection[11] / z);
+        float s = (z - .35f * f) / (f - .35f * f);
+        float amount = s * s * (3 - 2 * s) * palette::fogStrength;
+        for (int i = 0; i < 3; i++) {
+            int expected = int(roundf(graded[i] + (palette::fogColor[i] * 255 - graded[i]) * amount));
+            assert(abs(distant[i] - expected) <= 3);
+        }
+        // Without a projection or depth, fog is off and the grade is unchanged.
+        palette::fogEnabled = true;
+        palette::target = rt;
+        rt->AddRef();
+        palette::projectionKnown = false;
+        palette::finished = false;
+        c->OMSetRenderTargets(1, &rt, nullptr);
+        assert(palette::apply());
+        c->OMSetRenderTargets(0, nullptr, nullptr);
+        palette::drop(dsv);
+        palette::drop(depthTexture);
+        palette::drop(rt);
+        palette::drop(readback);
+        palette::drop(t);
+        printf("Distance fog: sky untouched, near clear, far blended (%d,%d,%d -> %d,%d,%d) PASS\n",
+               graded[0], graded[1], graded[2], distant[0], distant[1], distant[2]);
     }
     palette::drop(c);
     palette::drop(d);

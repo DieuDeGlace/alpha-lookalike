@@ -23,3 +23,9 @@ Close Steam Cube World, copy build/alpha-lookalike.dll to Mods, and optionally c
 Settings: Enabled=1, SaturationPercent=90, CoolTintPercent=4 under [Palette] in Mods/alpha-lookalike.ini. ReShade is untouched; existing effects still influence the final image.
 
 Targets inspected Steam executable timestamp 0x5d93ab0d/image size 0x5b7000. Native world draw constants identify the scene; grading occurs before the observed HUD boundary. Unknown boundaries skip grading rather than tinting menus. One GPU scene copy/resolve and one fullscreen pass; no CPU GPU readbacks. Actual target dimensions are used. WARP tests cover palette colors, state restoration and binding release at 720p, 1080p and 360p; live visual/UI/performance verification remains necessary.
+
+## Distance fog
+
+Alpha/Omega-like fog: distant world fades toward the colour of the visible sky, so it matches day, night and weather; a configurable colour is used when no sky is in view. It is measured from the camera using the native scene depth and projection, so it recedes as you move and returns behind you. The sky itself is never fogged, and the HUD is unaffected. Fog runs inside the existing grade pass (no extra pass): one depth copy plus a few texture reads per pixel.
+
+`[Fog]` in `Mods/alpha-lookalike.ini`: `StartPercent` (default 35) and `EndPercent` (100) of the draw distance set where fog begins and reaches full strength, so it follows the in-game render distance and hides chunk pop-in at the edge; `StrengthPercent` (85) caps it; `ColorRed/Green/Blue` is the no-sky colour; `Enabled=0` turns it off. Multisampled or unusual depth buffers leave fog off.

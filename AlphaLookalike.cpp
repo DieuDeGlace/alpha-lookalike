@@ -7,6 +7,11 @@
 // the first orthographic (HUD) draw arrives it grades the finished 3D scene in
 // place, so the HUD itself is never tinted. TemporalAA calls
 // FinishAlphaLookalike() so the grade happens before its resolve.
+//
+// Distance fog (Alpha/Omega-like): the scene depth and native projection give
+// each pixel's view distance; distant world fades toward the sky's own colour,
+// from FogStartPercent to FogEndPercent of the draw distance. It follows the
+// camera, so it recedes as you walk; the sky itself is never fogged.
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include "cwsdk.h"
@@ -83,6 +88,9 @@ static bool readBuffer(ID3D11Buffer *b, void *out, UINT n) {
 static bool enabled = true, internal = false, finished = false;
 // Settings (see alpha-lookalike.ini).
 static float saturation = .90f, cool = .04f;
+static bool fogEnabled = true;
+static float fogStart = .35f, fogEnd = 1.f, fogStrength = .85f; // Fractions of draw distance.
+static float fogColor[3] = {40 / 255.f, 70 / 255.f, 150 / 255.f}; // When no sky is visible.
 static ID3D11Device *device = nullptr;
 static ID3D11DeviceContext *context = nullptr;
 static ID3D11DeviceContext1 *context1 = nullptr;
@@ -90,6 +98,12 @@ static ID3DDeviceContextState *state = nullptr; // Isolated pipeline state for o
 static ID3D11Texture2D *copy = nullptr;         // This frame's scene, as shader input.
 static ID3D11ShaderResourceView *view = nullptr;
 static ID3D11RenderTargetView *target = nullptr; // The scene target of this frame.
+static ID3D11DepthStencilView *sceneDepth = nullptr; // ...and its depth buffer.
+static float sceneProjection[16]{};                  // Native projection of the world.
+static bool projectionKnown = false;
+static ID3D11Texture2D *depthCopy = nullptr; // Readable copy of the scene depth.
+static ID3D11ShaderResourceView *depthView = nullptr;
+static DXGI_FORMAT depthFamily = DXGI_FORMAT_UNKNOWN;
 static D3D11_VIEWPORT viewport{};
 static ID3D11VertexShader *vs = nullptr;
 static ID3D11PixelShader *ps = nullptr;
@@ -100,20 +114,25 @@ static D oldD = nullptr;
 static UINT width = 0, height = 0;
 static DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
 
-// vs: full-screen triangle from SV_VertexID. ps: the colour grade.
+// vs: full-screen triangle from SV_VertexID. ps: the colour grade, then fog.
 static const char *code = R"(
-cbuffer Grade:register(b0){float saturation,cool,pad0,pad1;};
+cbuffer Grade:register(b0){
+    float saturation,cool,fog,fogStrength;
+    float4 fogColor;        // rgb: used when no sky pixel is visible.
+    float4 depthToDistance; // Native projection P[10], P[11], P[14], P[15].
+    float fogStart,fogEnd,pad0,pad1;
+};
 Texture2D<float4> scene:register(t0);
+Texture2D<float> depth:register(t1);
 
 float4 vs(uint id:SV_VertexID):SV_POSITION{
     float2 p=float2((id<<1)&2,id&2);
     return float4(p*float2(2,-2)+float2(-1,1),0,1);
 }
 
-float4 ps(float4 p:SV_POSITION):SV_TARGET{
-    float4 original=scene.Load(int3(p.xy,0));
-    float l=dot(original.rgb,float3(.2126,.7152,.0722));
-    float3 c=lerp(l.xxx,original.rgb,saturation);
+float3 grade(float3 original){
+    float l=dot(original,float3(.2126,.7152,.0722));
+    float3 c=lerp(l.xxx,original,saturation);
     // References have mint-green highlights, teal shade and warm golden paths.
     float green=saturate((original.g-max(original.r,original.b))*3);
     float highlight=smoothstep(.25,.75,l);
@@ -125,12 +144,45 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
     // Modest cooler palette, stronger in shade; no exposure/gamma lift at night.
     float shade=1-smoothstep(.15,.8,l);
     c*=float3(1-cool*.6,1,1+cool*(.6+.4*shade));
-    return float4(saturate(c),original.a);
+    return saturate(c);
+}
+// The graded colour of the visible sky (depth 1) along the top of the screen,
+// so fog matches day, night and weather; the configured colour otherwise.
+float3 skyColor(uint w,uint h){
+    float3 sum=0;
+    float count=0;
+    [unroll]for(int i=0;i<8;i++){
+        int2 q=int2((i+.5)*w/8,h*((i&1)?.06:.16));
+        if(depth.Load(int3(q,0))>=.99999){
+            sum+=grade(scene.Load(int3(q,0)).rgb);
+            count+=1;
+        }
+    }
+    return count>0?sum/count:fogColor.rgb;
+}
+float4 ps(float4 p:SV_POSITION):SV_TARGET{
+    float4 original=scene.Load(int3(p.xy,0));
+    float3 c=grade(original.rgb);
+    [branch]if(fog>.5){
+        float d=depth.Load(int3(p.xy,0));
+        float denominator=d*depthToDistance.z-depthToDistance.x;
+        if(d<.99999&&abs(denominator)>1e-8){
+            // Linear view distance from the depth and the native projection.
+            float distance=abs((depthToDistance.y-d*depthToDistance.w)/denominator);
+            float amount=smoothstep(fogStart,fogEnd,distance)*fogStrength;
+            uint w,h;
+            scene.GetDimensions(w,h);
+            c=lerp(c,skyColor(w,h),amount);
+        }
+    }
+    return float4(c,original.a);
 })";
 
 // Called once per presented frame.
 static void reset() {
     drop(target);
+    drop(sceneDepth);
+    projectionKnown = false;
     finished = false;
 }
 
@@ -166,7 +218,7 @@ static bool initialize(ID3D11DeviceContext *c) {
         drop(error);
     }
     D3D11_BUFFER_DESC cb{};
-    cb.ByteWidth = 16;
+    cb.ByteWidth = 64;
     cb.Usage = D3D11_USAGE_DEFAULT;
     cb.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (ok)
@@ -201,6 +253,96 @@ static bool texture(ID3D11Texture2D *source, DXGI_FORMAT typed) {
     d.MiscFlags = 0;
     return SUCCEEDED(device->CreateTexture2D(&d, nullptr, &copy)) &&
            SUCCEEDED(device->CreateShaderResourceView(copy, nullptr, &view));
+}
+
+// Copies this frame's single-sample scene depth into a readable texture.
+// Unsupported layouts (MSAA, other sizes/formats) simply leave fog off.
+static bool copyDepth(UINT w, UINT h) {
+    if (!sceneDepth)
+        return false;
+    ID3D11Resource *resource = nullptr;
+    sceneDepth->GetResource(&resource);
+    ID3D11Texture2D *source = nullptr;
+    bool ok = SUCCEEDED(resource->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&source));
+    drop(resource);
+    if (!ok)
+        return false;
+    D3D11_TEXTURE2D_DESC d{};
+    source->GetDesc(&d);
+    DXGI_FORMAT typeless = DXGI_FORMAT_UNKNOWN, readable = DXGI_FORMAT_UNKNOWN;
+    switch (d.Format) {
+    case DXGI_FORMAT_D24_UNORM_S8_UINT:
+    case DXGI_FORMAT_R24G8_TYPELESS:
+        typeless = DXGI_FORMAT_R24G8_TYPELESS;
+        readable = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
+        break;
+    case DXGI_FORMAT_D32_FLOAT:
+    case DXGI_FORMAT_R32_TYPELESS:
+        typeless = DXGI_FORMAT_R32_TYPELESS;
+        readable = DXGI_FORMAT_R32_FLOAT;
+        break;
+    case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+    case DXGI_FORMAT_R32G8X24_TYPELESS:
+        typeless = DXGI_FORMAT_R32G8X24_TYPELESS;
+        readable = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+        break;
+    case DXGI_FORMAT_D16_UNORM:
+    case DXGI_FORMAT_R16_TYPELESS:
+        typeless = DXGI_FORMAT_R16_TYPELESS;
+        readable = DXGI_FORMAT_R16_UNORM;
+        break;
+    default:
+        break;
+    }
+    if (typeless == DXGI_FORMAT_UNKNOWN || d.SampleDesc.Count != 1 || d.Width != w ||
+        d.Height != h || d.ArraySize != 1 || d.MipLevels != 1) {
+        drop(source);
+        return false;
+    }
+    D3D11_TEXTURE2D_DESC existing{};
+    if (depthCopy)
+        depthCopy->GetDesc(&existing);
+    if (!depthCopy || existing.Width != w || existing.Height != h || depthFamily != typeless) {
+        drop(depthView);
+        drop(depthCopy);
+        d.Format = typeless;
+        d.Usage = D3D11_USAGE_DEFAULT;
+        d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        d.CPUAccessFlags = d.MiscFlags = 0;
+        D3D11_SHADER_RESOURCE_VIEW_DESC v{};
+        v.Format = readable;
+        v.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        v.Texture2D.MipLevels = 1;
+        if (FAILED(device->CreateTexture2D(&d, nullptr, &depthCopy)) ||
+            FAILED(device->CreateShaderResourceView(depthCopy, &v, &depthView))) {
+            drop(depthView);
+            drop(depthCopy);
+            drop(source);
+            return false;
+        }
+        depthFamily = typeless;
+    }
+    context->CopyResource(depthCopy, source);
+    drop(source);
+    return true;
+}
+// Fog constants from the native projection: P[10], P[11], P[14], P[15] turn a
+// depth value into view distance; the draw distance is its value at depth 1.
+static bool fogConstants(float *out) {
+    if (!fogEnabled || !projectionKnown || fogStrength <= 0)
+        return false;
+    const float *p = sceneProjection;
+    float drawDistance = (p[11] - p[15]) / (p[14] - p[10]);
+    if (!std::isfinite(drawDistance) || fabsf(drawDistance) < 1e-3f)
+        return false;
+    drawDistance = fabsf(drawDistance);
+    out[0] = p[10];
+    out[1] = p[11];
+    out[2] = p[14];
+    out[3] = p[15];
+    out[4] = fogStart * drawDistance;
+    out[5] = std::max(fogEnd * drawDistance, out[4] + 1e-3f);
+    return true;
 }
 
 // Grades the scene in `target` once per frame, in an isolated context state.
@@ -246,13 +388,19 @@ static bool apply() {
     context->IASetInputLayout(nullptr);
     context->VSSetShader(vs, nullptr, 0);
     context->PSSetShader(ps, nullptr, 0);
-    float values[4] = {saturation, cool, 0, 0};
+    float fog[6]{};
+    bool fogged = fogConstants(fog) && copyDepth(td.Width, td.Height);
+    float values[16] = {saturation, cool, fogged ? 1.f : 0.f, fogStrength,
+                        fogColor[0], fogColor[1], fogColor[2], 1,
+                        fog[0], fog[1], fog[2], fog[3],
+                        fog[4], fog[5], 0, 0};
     context->UpdateSubresource(params, 0, nullptr, values, 0, 0);
     context->PSSetConstantBuffers(0, 1, &params);
-    context->PSSetShaderResources(0, 1, &view);
+    ID3D11ShaderResourceView *inputs[2] = {view, fogged ? depthView : nullptr};
+    context->PSSetShaderResources(0, 2, inputs);
     oldD(context, 3, 0); // Full-screen triangle.
-    ID3D11ShaderResourceView *empty = nullptr;
-    context->PSSetShaderResources(0, 1, &empty);
+    ID3D11ShaderResourceView *empty[2] = {};
+    context->PSSetShaderResources(0, 2, empty);
     context->OMSetRenderTargets(0, nullptr, nullptr);
     context1->SwapDeviceContextState(saved, nullptr);
     drop(saved);
@@ -322,7 +470,9 @@ static void before(ID3D11DeviceContext *c) {
     if (!target) {
         context = c;
         viewport = vp;
-        c->OMGetRenderTargets(1, &target, nullptr);
+        c->OMGetRenderTargets(1, &target, &sceneDepth);
+        memcpy(sceneProjection, projection, sizeof(sceneProjection));
+        projectionKnown = true;
     }
 }
 
@@ -384,6 +534,19 @@ static void loadSettings() {
         .01f;
     cool = std::clamp((int)GetPrivateProfileIntW(L"Palette", L"CoolTintPercent", 4, ini), 0, 10) *
            .01f;
+    auto percent = [&](const wchar_t *name, int fallback, int high) {
+        return std::clamp((int)GetPrivateProfileIntW(L"Fog", name, fallback, ini), 0, high) * .01f;
+    };
+    fogEnabled = GetPrivateProfileIntW(L"Fog", L"Enabled", 1, ini) != 0;
+    fogStart = percent(L"StartPercent", 35, 100);
+    fogEnd = std::max(percent(L"EndPercent", 100, 150), fogStart + .01f);
+    fogStrength = percent(L"StrengthPercent", 85, 100);
+    const wchar_t *channels[] = {L"ColorRed", L"ColorGreen", L"ColorBlue"};
+    const int defaults[] = {40, 70, 150};
+    for (int i = 0; i < 3; i++)
+        fogColor[i] =
+            std::clamp((int)GetPrivateProfileIntW(L"Fog", channels[i], defaults[i], ini), 0, 255) /
+            255.f;
 }
 
 // Hooks the shared ID3D11DeviceContext vtable (taken from a temporary device).

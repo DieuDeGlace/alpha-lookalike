@@ -113,6 +113,46 @@ int main() {
         projection[10] = f / (f - n);
         projection[11] = -n * f / (f - n);
         projection[14] = 1;
+        {
+            // A rotation-only background can bind the native solid layout.
+            // It must not claim the scene, even if a depth target is present.
+            ID3D11Buffer *buffers[6]{};
+            const UINT sizes[] = {64, 64, 64, 16, 320, 48};
+            for (unsigned i = 0; i < 6; ++i) {
+                D3D11_BUFFER_DESC desc{};
+                desc.ByteWidth = sizes[i];
+                desc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+                assert(SUCCEEDED(d->CreateBuffer(&desc, nullptr, &buffers[i])));
+            }
+            float camera[16]{};
+            camera[0] = camera[5] = camera[10] = camera[15] = 1;
+            buffers[0]->SetPrivateData(palette::cacheGuid, 64, projection);
+            buffers[1]->SetPrivateData(palette::cacheGuid, 64, camera);
+            c->VSSetConstantBuffers(0, 6, buffers);
+            D3D11_VIEWPORT vp{0, 0, float(w), float(h), 0, 1};
+            c->RSSetViewports(1, &vp);
+            palette::reset();
+            c->OMSetRenderTargets(1, &rt, dsv);
+            palette::before(c);
+            assert(!palette::target && !palette::sceneDepth && !palette::projectionKnown);
+            camera[11] = -10;
+            buffers[1]->SetPrivateData(palette::cacheGuid, 64, camera);
+            c->OMSetRenderTargets(1, &rt, nullptr);
+            palette::before(c);
+            assert(!palette::target && !palette::projectionKnown);
+            c->OMSetRenderTargets(1, &rt, dsv);
+            palette::before(c);
+            assert(palette::target == rt && palette::sceneDepth == dsv && palette::projectionKnown);
+            assert(memcmp(palette::sceneProjection, projection, 64) == 0);
+            palette::reset();
+            assert(!palette::target && !palette::sceneDepth && palette::solidDistance == 0);
+            c->OMSetRenderTargets(0, nullptr, nullptr);
+            ID3D11Buffer *empty[6]{};
+            c->VSSetConstantBuffers(0, 6, empty);
+            for (auto &buffer : buffers)
+                palette::drop(buffer);
+            puts("Fog scene capture: rotation-only sky and depthless views excluded: PASS");
+        }
         auto run = [&](float depthValue, bool freshSky = true) {
             if (freshSky)
                 palette::skyValid = false; // each case starts without sky history
@@ -259,92 +299,101 @@ int main() {
         // both when the depth is shader-readable (read in place) and when it
         // has to be copied. The result must match the single-sample fog.
         const UINT w = 640, h = 360;
-        const float n = .5f, f = 100.f;
-        float projection[16]{};
-        projection[0] = projection[5] = 1;
-        projection[10] = f / (f - n);
-        projection[11] = -n * f / (f - n);
-        projection[14] = 1;
-        for (bool readable : {true, false}) {
-            D3D11_TEXTURE2D_DESC td{};
-            td.Width = w;
-            td.Height = h;
-            td.MipLevels = td.ArraySize = 1;
-            td.SampleDesc = {4, 0};
-            td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-            td.BindFlags = D3D11_BIND_RENDER_TARGET;
-            ID3D11Texture2D *t = nullptr, *resolved = nullptr, *readback = nullptr,
-                            *depthTexture = nullptr;
-            ID3D11RenderTargetView *rt = nullptr;
-            ID3D11DepthStencilView *dsv = nullptr;
-            assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &t)));
-            assert(SUCCEEDED(d->CreateRenderTargetView(t, nullptr, &rt)));
-            td.SampleDesc = {1, 0};
-            td.BindFlags = 0;
-            assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &resolved)));
-            td.Usage = D3D11_USAGE_STAGING;
-            td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-            assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &readback)));
-            td.Usage = D3D11_USAGE_DEFAULT;
-            td.CPUAccessFlags = 0;
-            td.SampleDesc = {4, 0};
-            td.Format = readable ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_D24_UNORM_S8_UINT;
-            td.BindFlags = D3D11_BIND_DEPTH_STENCIL | (readable ? D3D11_BIND_SHADER_RESOURCE : 0);
-            assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &depthTexture)));
-            D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
-            dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
-            dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
-            assert(SUCCEEDED(d->CreateDepthStencilView(depthTexture, &dv, &dsv)));
-            auto run = [&](float depthValue, bool fogOn) {
-                palette::skyValid = false;
-                float color[] = {.8f, .2f, .1f, 1};
-                c->ClearRenderTargetView(rt, color);
-                c->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, depthValue, 0);
-                palette::fogEnabled = fogOn;
-                palette::target = rt;
-                rt->AddRef();
-                palette::sceneDepth = dsv;
-                dsv->AddRef();
-                memcpy(palette::sceneProjection, projection, 64);
-                palette::projectionKnown = true;
-                palette::viewport = {0, 0, (float)w, (float)h, 0, 1};
-                palette::finished = false;
-                c->OMSetRenderTargets(1, &rt, nullptr);
-                assert(palette::apply());
-                palette::drop(palette::sceneDepth);
-                c->OMSetRenderTargets(0, nullptr, nullptr);
-                c->ResolveSubresource(resolved, 0, t, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
-                c->CopyResource(readback, resolved);
-                D3D11_MAPPED_SUBRESOURCE map{};
-                assert(SUCCEEDED(c->Map(readback, 0, D3D11_MAP_READ, 0, &map)));
-                auto pixel = (unsigned char *)map.pData + (h / 2) * map.RowPitch + (w / 2) * 4;
-                std::array<int, 3> rgb{pixel[0], pixel[1], pixel[2]};
-                c->Unmap(readback, 0);
-                return rgb;
-            };
-            auto graded = run(.5f, false);
-            float z = 30;
-            auto distant = run(projection[10] + projection[11] / z, true);
-            float s = (z - palette::fogStart * f) / ((palette::fogEnd - palette::fogStart) * f);
-            float amount = s * s * (3 - 2 * s) * palette::fogStrength;
-            for (int i = 0; i < 3; i++) {
-                int expected =
-                    int(roundf(graded[i] + (palette::fogColor[i] * 255 - graded[i]) * amount));
-                assert(abs(distant[i] - expected) <= 3);
+        // A small near plane puts real distant surfaces above 0.99999 depth.
+        // Those surfaces must receive fog, never become sky-colour probes.
+        for (float n : {.5f, .0002f}) {
+            const float f = 100.f;
+            float projection[16]{};
+            projection[0] = projection[5] = 1;
+            projection[10] = f / (f - n);
+            projection[11] = -n * f / (f - n);
+            projection[14] = 1;
+            for (bool readable : {true, false}) {
+                D3D11_TEXTURE2D_DESC td{};
+                td.Width = w;
+                td.Height = h;
+                td.MipLevels = td.ArraySize = 1;
+                td.SampleDesc = {4, 0};
+                td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                td.BindFlags = D3D11_BIND_RENDER_TARGET;
+                ID3D11Texture2D *t = nullptr, *resolved = nullptr, *readback = nullptr,
+                                *depthTexture = nullptr;
+                ID3D11RenderTargetView *rt = nullptr;
+                ID3D11DepthStencilView *dsv = nullptr;
+                assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &t)));
+                assert(SUCCEEDED(d->CreateRenderTargetView(t, nullptr, &rt)));
+                td.SampleDesc = {1, 0};
+                td.BindFlags = 0;
+                assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &resolved)));
+                td.Usage = D3D11_USAGE_STAGING;
+                td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+                assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &readback)));
+                td.Usage = D3D11_USAGE_DEFAULT;
+                td.CPUAccessFlags = 0;
+                td.SampleDesc = {4, 0};
+                td.Format = readable ? DXGI_FORMAT_R24G8_TYPELESS : DXGI_FORMAT_D24_UNORM_S8_UINT;
+                td.BindFlags =
+                    D3D11_BIND_DEPTH_STENCIL | (readable ? D3D11_BIND_SHADER_RESOURCE : 0);
+                assert(SUCCEEDED(d->CreateTexture2D(&td, nullptr, &depthTexture)));
+                D3D11_DEPTH_STENCIL_VIEW_DESC dv{};
+                dv.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+                dv.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2DMS;
+                assert(SUCCEEDED(d->CreateDepthStencilView(depthTexture, &dv, &dsv)));
+                auto run = [&](float depthValue, bool fogOn) {
+                    palette::skyValid = false;
+                    float color[] = {.8f, .2f, .1f, 1};
+                    c->ClearRenderTargetView(rt, color);
+                    c->ClearDepthStencilView(dsv, D3D11_CLEAR_DEPTH, depthValue, 0);
+                    palette::fogEnabled = fogOn;
+                    palette::target = rt;
+                    rt->AddRef();
+                    palette::sceneDepth = dsv;
+                    dsv->AddRef();
+                    memcpy(palette::sceneProjection, projection, 64);
+                    palette::projectionKnown = true;
+                    palette::viewport = {0, 0, (float)w, (float)h, 0, 1};
+                    palette::finished = false;
+                    c->OMSetRenderTargets(1, &rt, nullptr);
+                    assert(palette::apply());
+                    palette::drop(palette::sceneDepth);
+                    c->OMSetRenderTargets(0, nullptr, nullptr);
+                    c->ResolveSubresource(resolved, 0, t, 0, DXGI_FORMAT_R8G8B8A8_UNORM);
+                    c->CopyResource(readback, resolved);
+                    D3D11_MAPPED_SUBRESOURCE map{};
+                    assert(SUCCEEDED(c->Map(readback, 0, D3D11_MAP_READ, 0, &map)));
+                    auto pixel = (unsigned char *)map.pData + (h / 2) * map.RowPitch + (w / 2) * 4;
+                    std::array<int, 3> rgb{pixel[0], pixel[1], pixel[2]};
+                    c->Unmap(readback, 0);
+                    return rgb;
+                };
+                auto graded = run(.5f, false);
+                float z = 30;
+                auto distant = run(projection[10] + projection[11] / z, true);
+                // Use the representable projection's far plane: very small near
+                // planes lose precision when f/(f-n) is stored as a float.
+                float actualFar = fabsf(projection[11] / (1 - projection[10]));
+                float s = (z - palette::fogStart * actualFar) /
+                          ((palette::fogEnd - palette::fogStart) * actualFar);
+                float amount = s * s * (3 - 2 * s) * palette::fogStrength;
+                for (int i = 0; i < 3; i++) {
+                    int expected =
+                        int(roundf(graded[i] + (palette::fogColor[i] * 255 - graded[i]) * amount));
+                    assert(abs(distant[i] - expected) <= 3);
+                }
+                assert(distant != graded);
+                assert(palette::depthMultisampled);
+                assert(readable ? palette::depthInput == palette::depthSourceView
+                                : palette::depthInput == palette::depthView);
+                palette::drop(dsv);
+                palette::drop(depthTexture);
+                palette::drop(rt);
+                palette::drop(readback);
+                palette::drop(resolved);
+                palette::drop(t);
+                printf("MSAA fog (%s depth): (%d,%d,%d) -> (%d,%d,%d) PASS\n",
+                       readable ? "in-place" : "copied", graded[0], graded[1], graded[2],
+                       distant[0], distant[1], distant[2]);
             }
-            assert(distant != graded);
-            assert(palette::depthMultisampled);
-            assert(readable ? palette::depthInput == palette::depthSourceView
-                            : palette::depthInput == palette::depthView);
-            palette::drop(dsv);
-            palette::drop(depthTexture);
-            palette::drop(rt);
-            palette::drop(readback);
-            palette::drop(resolved);
-            palette::drop(t);
-            printf("MSAA fog (%s depth): (%d,%d,%d) -> (%d,%d,%d) PASS\n",
-                   readable ? "in-place" : "copied", graded[0], graded[1], graded[2], distant[0],
-                   distant[1], distant[2]);
         }
     }
     palette::drop(c);

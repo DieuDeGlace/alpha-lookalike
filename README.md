@@ -26,6 +26,16 @@ Targets inspected Steam executable timestamp 0x5d93ab0d/image size 0x5b7000. Nat
 
 ## Distance fog
 
-Alpha/Omega-like fog: distant world fades toward the colour of the visible sky, so it matches day, night and weather; a configurable colour is used when no sky is in view. It is measured from the camera using the native scene depth and projection, so it recedes as you move and returns behind you. The sky itself is never fogged, and the HUD is unaffected. Fog runs inside the existing grade pass (no extra pass): one depth copy plus a few texture reads per pixel.
+Alpha/Omega-like fog: distant world fades toward the colour of the visible sky, so it matches day, night and weather; a configurable colour is used until sky has been observed. It is measured from the camera using the native scene depth and projection. The sky itself is never fogged, and the HUD is unaffected. Fog runs inside the existing grade pass, with a separate one-pixel sky-colour update. Shader-readable depth is read in place; other supported depth targets are copied. Both single-sample and MSAA depth are supported.
 
-`[Fog]` in `Mods/alpha-lookalike.ini`: `StartPercent` (default 8) and `EndPercent` (55) of the draw distance set where fog begins and reaches full strength, so it follows the in-game render distance and hides chunk pop-in at the edge; `StrengthPercent` (90) caps it; `ColorRed/Green/Blue` is the no-sky colour; `Enabled=0` turns it off. Multisampled or unusual depth buffers leave fog off.
+`[Fog]` in `Mods/alpha-lookalike.ini`: `StartPercent` (default 8) and `EndPercent` (55) of the projection's far distance set the fade range; `StrengthPercent` (90) sets its strength there. With `Cull=1`, fog rises to opaque at `SolidPercent` (70) and native draws wholly beyond it are skipped. `ColorRed/Green/Blue` is the initial fallback colour; `Enabled=0` or F6 toggles fog. Unknown depth formats leave fog off.
+
+The `fix/fog-world-camera` branch captures only a translated, depth-backed
+world camera. Rotation-only sky draws cannot claim the fog scene, and culling
+is reset until the current frame has a valid world projection. Only the exact
+clear depth (1.0) is treated as sky: valid distant surfaces above 0.99999 must
+still receive fog. Tests cover both capture failures, small near planes,
+single-sample/MSAA depth, state restoration and the existing colour grade.
+The log periodically records the captured projection and fog distances; live
+visual verification is required before treating the reported missing fog as
+fully resolved.

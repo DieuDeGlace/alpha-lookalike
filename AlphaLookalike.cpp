@@ -192,7 +192,7 @@ float4 skyPass(float4 p:SV_POSITION):SV_TARGET{
     float count=0;
     [unroll]for(int i=0;i<8;i++){
         int2 q=int2((i+.5)*w/8,h*((i&1)?.06:.16));
-        if(depthAt(q)>=.99999){
+        if(depthAt(q)>=1){
             sum+=grade(scene.Load(int3(q,0)).rgb);
             count+=1;
         }
@@ -209,7 +209,7 @@ float4 ps(float4 p:SV_POSITION):SV_TARGET{
     [branch]if(fog>.5){
         float d=depthAt(int2(p.xy));
         float denominator=d*depthToDistance.z-depthToDistance.x;
-        if(d<.99999&&abs(denominator)>1e-8){
+        if(d<1&&abs(denominator)>1e-8){
             // Linear view distance from the depth and the native projection.
             float distance=abs((depthToDistance.y-d*depthToDistance.w)/denominator);
             float amount=smoothstep(fogStart,fogEnd,distance)*fogStrength;
@@ -234,8 +234,7 @@ static void reset() {
         log(s);
         culledDraws = worldDraws = 0;
     }
-    float fog[7]{};
-    solidDistance = fogConstants(fog) ? fog[6] : 0;
+    solidDistance = 0; // Re-enable only after this frame's world camera is captured.
     drop(target);
     drop(sceneDepth);
     projectionKnown = false;
@@ -581,11 +580,38 @@ static void before(ID3D11DeviceContext *c) {
     if (!n || vp.Width < 320 || vp.Height < 180 || vp.TopLeftX || vp.TopLeftY)
         return; // Not the full-screen scene.
     if (!target) {
+        // The sky can retain the solid shader's lighting buffers. Its camera
+        // has no translation and can have a different far plane or no depth
+        // target. Never let it claim the world's fog projection/depth.
+        ID3D11Buffer *cameraBuffer = nullptr;
+        c->VSGetConstantBuffers(1, 1, &cameraBuffer);
+        float camera[16]{};
+        bool cameraKnown = readBuffer(cameraBuffer, camera, 64);
+        drop(cameraBuffer);
+        if (!cameraKnown || fabsf(camera[3]) + fabsf(camera[7]) + fabsf(camera[11]) < .01f)
+            return;
         context = c;
         viewport = vp;
         c->OMGetRenderTargets(1, &target, &sceneDepth);
+        if (!target || !sceneDepth) {
+            drop(target);
+            drop(sceneDepth);
+            return; // Keep looking for the depth-backed world scene.
+        }
         memcpy(sceneProjection, projection, sizeof(sceneProjection));
         projectionKnown = true;
+        float fog[7]{};
+        solidDistance = fogConstants(fog) ? fog[6] : 0;
+        static unsigned cameraReports = 0;
+        if (cameraReports++ % 3600 == 0) {
+            char message[224];
+            sprintf_s(message,
+                      "World fog: enabled=%d projection=(%.9g,%.9g,%.9g,%.9g) "
+                      "start=%.3f end=%.3f opaque=%.3f (view units).",
+                      fogEnabled, projection[10], projection[11], projection[14], projection[15],
+                      fog[4], fog[5], fog[6]);
+            log(message);
+        }
     }
 }
 

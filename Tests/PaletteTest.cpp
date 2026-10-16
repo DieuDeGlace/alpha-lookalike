@@ -133,15 +133,15 @@ int main() {
             c->RSSetViewports(1, &vp);
             palette::reset();
             c->OMSetRenderTargets(1, &rt, dsv);
-            palette::before(c);
+            palette::skipDraw(c);
             assert(!palette::target && !palette::sceneDepth && !palette::projectionKnown);
             camera[11] = -10;
             buffers[1]->SetPrivateData(palette::cacheGuid, 64, camera);
             c->OMSetRenderTargets(1, &rt, nullptr);
-            palette::before(c);
+            palette::skipDraw(c);
             assert(!palette::target && !palette::projectionKnown);
             c->OMSetRenderTargets(1, &rt, dsv);
-            palette::before(c);
+            palette::skipDraw(c);
             assert(palette::target == rt && palette::sceneDepth == dsv && palette::projectionKnown);
             assert(memcmp(palette::sceneProjection, projection, 64) == 0);
             palette::reset();
@@ -261,7 +261,7 @@ int main() {
                 float world[16] = {scale, 0, 0, 0, 0, scale, 0, 0, 0, 0, scale, z, 0, 0, 0, 1};
                 buffers[2]->SetPrivateData(palette::cacheGuid, 64, world);
                 c->VSSetConstantBuffers(0, 6, buffers);
-                return palette::culled(c);
+                return palette::skipDraw(c);
             };
             assert(cull(.05f, 90));                  // a small model far beyond the fog
             assert(!cull(.05f, 60));                 // ... and one inside it

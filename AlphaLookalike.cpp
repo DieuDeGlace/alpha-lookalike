@@ -67,12 +67,12 @@ static void log(const char *s) {
 }
 // 64 if `r` is a 64-byte constant buffer (a single matrix), otherwise 0.
 static UINT bytes(ID3D11Resource *r) {
-    ID3D11Buffer *b = nullptr;
-    if (FAILED(r->QueryInterface(__uuidof(ID3D11Buffer), (void **)&b)))
+    D3D11_RESOURCE_DIMENSION dimension{};
+    r->GetType(&dimension);
+    if (dimension != D3D11_RESOURCE_DIMENSION_BUFFER)
         return 0;
     D3D11_BUFFER_DESC d{};
-    b->GetDesc(&d);
-    b->Release();
+    static_cast<ID3D11Buffer *>(r)->GetDesc(&d);
     return (d.BindFlags & D3D11_BIND_CONSTANT_BUFFER) && d.ByteWidth == 64 ? 64 : 0;
 }
 // Reads the shadow copy of a constant buffer's contents.
@@ -523,35 +523,92 @@ static bool apply() {
     return true;
 }
 
-// Native world draws bind six vertex constant buffers of these sizes.
-static bool hasNativeWorldBuffers(ID3D11DeviceContext *c) {
-    ID3D11Buffer *worldBuffers[6]{};
-    c->VSGetConstantBuffers(0, 6, worldBuffers);
-    bool native = true;
-    const UINT sizes[] = {64, 64, 64, 16, 320, 48};
-    for (int i = 0; i < 6; i++) {
-        D3D11_BUFFER_DESC d{};
-        if (worldBuffers[i])
-            worldBuffers[i]->GetDesc(&d);
-        if (d.ByteWidth != sizes[i])
-            native = false;
-        drop(worldBuffers[i]);
+// Native world draws bind six vertex constant buffers of these sizes. Buffer
+// descriptions never change, so the result for the last binding tuple is
+// reused; the tuple is retained so a freed address cannot be mistaken for it.
+struct WorldLayout {
+    ID3D11Buffer *retained[6]{};
+    bool known = false, native = false;
+    bool check(ID3D11Buffer *const *buffers) {
+        if (known && memcmp(retained, buffers, sizeof(retained)) == 0)
+            return native;
+        const UINT sizes[] = {64, 64, 64, 16, 320, 48};
+        native = true;
+        for (int i = 0; i < 6; i++) {
+            drop(retained[i]);
+            retained[i] = buffers[i];
+            D3D11_BUFFER_DESC d{};
+            if (buffers[i]) {
+                buffers[i]->AddRef();
+                buffers[i]->GetDesc(&d);
+            }
+            native &= d.ByteWidth == sizes[i];
+        }
+        known = true;
+        return native;
     }
-    return native;
+};
+static WorldLayout worldLayout;
+
+// MoonandShadow's world pass must come before the grade. All mods are loaded
+// before the game renders, so the export is looked up once.
+static void finishWorldLighting() {
+    static auto finish = [] {
+        auto module = GetModuleHandleW(L"MoonandShadow.dll");
+        return module ? (void(WINAPI *)())GetProcAddress(module, "FinishWorldLighting") : nullptr;
+    }();
+    if (finish)
+        finish();
 }
 
-// Runs before every draw: remembers the scene target on the first native world
-// draw and grades the scene at the first orthographic draw into that target.
-static void before(ID3D11DeviceContext *c) {
-    if (!enabled || internal || finished)
+// On a full-screen native world draw before the scene is known: remembers its
+// target, depth and projection (and this frame's opaque fog distance).
+static void captureScene(ID3D11DeviceContext *c, ID3D11Buffer *const *b, const float *projection) {
+    UINT n = 1;
+    D3D11_VIEWPORT vp{};
+    c->RSGetViewports(&n, &vp);
+    if (!n || vp.Width < 320 || vp.Height < 180 || vp.TopLeftX || vp.TopLeftY)
+        return; // Not the full-screen scene.
+    // The sky can retain the solid shader's lighting buffers. Its camera
+    // has no translation and can have a different far plane or no depth
+    // target. Never let it claim the world's fog projection/depth.
+    float camera[16]{};
+    bool cameraKnown = readBuffer(b[1], camera, 64);
+    if (!cameraKnown || fabsf(camera[3]) + fabsf(camera[7]) + fabsf(camera[11]) < .01f)
         return;
-    ID3D11Buffer *b = nullptr;
-    c->VSGetConstantBuffers(0, 1, &b);
-    float projection[16]{};
-    bool known = readBuffer(b, projection, 64);
-    drop(b);
-    if (!known)
-        return;
+    context = c;
+    viewport = vp;
+    c->OMGetRenderTargets(1, &target, &sceneDepth);
+    if (!target || !sceneDepth) {
+        drop(target);
+        drop(sceneDepth);
+        return; // Keep looking for the depth-backed world scene.
+    }
+    memcpy(sceneProjection, projection, sizeof(sceneProjection));
+    projectionKnown = true;
+    float fog[7]{};
+    solidDistance = fogConstants(fog) ? fog[6] : 0;
+    static unsigned cameraReports = 0;
+    if (cameraReports++ % 3600 == 0) {
+        char message[224];
+        sprintf_s(message,
+                  "World fog: enabled=%d projection=(%.9g,%.9g,%.9g,%.9g) "
+                  "start=%.3f end=%.3f opaque=%.3f (view units).",
+                  fogEnabled, projection[10], projection[11], projection[14], projection[15],
+                  fog[4], fog[5], fog[6]);
+        log(message);
+    }
+}
+
+static bool culled(ID3D11Buffer *const *b, const float *projection);
+// Runs before every draw with the bound vertex constant buffers b0-b5:
+// remembers the scene on the first native world draw, grades it at the first
+// orthographic draw into its target, and returns true for a world draw hidden
+// by the opaque fog (see culled()).
+static bool before(ID3D11DeviceContext *c, ID3D11Buffer *const *b) {
+    float projection[16];
+    if (!readBuffer(b[0], projection, 64))
+        return false;
     bool orthographic = fabsf(projection[15]) > .5f;
     if (orthographic) {
         if (target) {
@@ -560,82 +617,37 @@ static void before(ID3D11DeviceContext *c) {
             bool same = current == target;
             drop(current);
             if (same) {
-                // MoonandShadow's world pass must come first.
-                auto module = GetModuleHandleW(L"MoonandShadow.dll");
-                auto finish = module
-                                  ? (void(WINAPI *)())GetProcAddress(module, "FinishWorldLighting")
-                                  : nullptr;
-                if (finish)
-                    finish();
+                finishWorldLighting();
                 apply();
             }
         }
-        return;
+        return false;
     }
-    if (!hasNativeWorldBuffers(c))
-        return;
-    UINT n = 1;
-    D3D11_VIEWPORT vp{};
-    c->RSGetViewports(&n, &vp);
-    if (!n || vp.Width < 320 || vp.Height < 180 || vp.TopLeftX || vp.TopLeftY)
-        return; // Not the full-screen scene.
-    if (!target) {
-        // The sky can retain the solid shader's lighting buffers. Its camera
-        // has no translation and can have a different far plane or no depth
-        // target. Never let it claim the world's fog projection/depth.
-        ID3D11Buffer *cameraBuffer = nullptr;
-        c->VSGetConstantBuffers(1, 1, &cameraBuffer);
-        float camera[16]{};
-        bool cameraKnown = readBuffer(cameraBuffer, camera, 64);
-        drop(cameraBuffer);
-        if (!cameraKnown || fabsf(camera[3]) + fabsf(camera[7]) + fabsf(camera[11]) < .01f)
-            return;
-        context = c;
-        viewport = vp;
-        c->OMGetRenderTargets(1, &target, &sceneDepth);
-        if (!target || !sceneDepth) {
-            drop(target);
-            drop(sceneDepth);
-            return; // Keep looking for the depth-backed world scene.
-        }
-        memcpy(sceneProjection, projection, sizeof(sceneProjection));
-        projectionKnown = true;
-        float fog[7]{};
-        solidDistance = fogConstants(fog) ? fog[6] : 0;
-        static unsigned cameraReports = 0;
-        if (cameraReports++ % 3600 == 0) {
-            char message[224];
-            sprintf_s(message,
-                      "World fog: enabled=%d projection=(%.9g,%.9g,%.9g,%.9g) "
-                      "start=%.3f end=%.3f opaque=%.3f (view units).",
-                      fogEnabled, projection[10], projection[11], projection[14], projection[15],
-                      fog[4], fog[5], fog[6]);
-            log(message);
-        }
-    }
+    if (!worldLayout.check(b))
+        return false;
+    if (!target)
+        captureScene(c, b, projection);
+    return culled(b, projection);
 }
 
 // True for a native world draw that lies wholly beyond the opaque fog: every
 // pixel it would cover would be pure fog colour, so it is skipped. Uses a
 // conservative bounding sphere: 78 blocks around a terrain chunk's centre (unit
-// world scale), 128 voxels around the model's centre for models.
-static bool culled(ID3D11DeviceContext *c) {
-    if (solidDistance <= 0 || internal || finished || !hasNativeWorldBuffers(c))
+// world scale), 128 voxels around the model's centre for models. `b` and
+// `projection` are the draw's native buffers and its (perspective) projection.
+static bool culled(ID3D11Buffer *const *b, const float *projection) {
+    if (solidDistance <= 0)
         return false;
-    ID3D11Buffer *b[3]{};
-    c->VSGetConstantBuffers(0, 3, b);
-    float projection[16], view[16], world[16];
-    bool known = readBuffer(b[0], projection, 64) && readBuffer(b[1], view, 64) &&
-                 readBuffer(b[2], world, 64);
-    for (auto *x : b)
-        drop(x);
     // The world camera: perspective, same focal lengths and depth range as the
     // scene (TemporalAA's jitter only changes the offset terms).
     auto close = [](float a, float b) { return fabsf(a - b) <= 1e-4f * std::max(1.f, fabsf(b)); };
-    if (!known || fabsf(projection[15]) > .5f || !close(projection[0], sceneProjection[0]) ||
+    if (!close(projection[0], sceneProjection[0]) ||
         !close(projection[5], sceneProjection[5]) || !close(projection[10], sceneProjection[10]) ||
         !close(projection[11], sceneProjection[11]) || !close(projection[14], sceneProjection[14]))
-        return false; // orthographic UI, previews, other views
+        return false; // previews, other views
+    float view[16], world[16];
+    if (!readBuffer(b[1], view, 64) || !readBuffer(b[2], world, 64))
+        return false;
     float scale = 0;
     for (int column = 0; column < 3; ++column)
         scale = std::max(scale, sqrtf(world[column] * world[column] +
@@ -663,17 +675,25 @@ static bool culled(ID3D11DeviceContext *c) {
 // Hooks
 // ===========================================================================
 
+// One fetch of the vertex constant buffers per draw; nothing once the scene
+// has been graded (the HUD and later passes).
+static bool skipDraw(ID3D11DeviceContext *c) {
+    if (!enabled || internal || finished)
+        return false;
+    ID3D11Buffer *b[6]{};
+    c->VSGetConstantBuffers(0, 6, b);
+    bool skip = before(c, b);
+    for (auto *x : b)
+        drop(x);
+    return skip;
+}
 static void STDMETHODCALLTYPE di(ID3D11DeviceContext *c, UINT n, UINT s, INT b) {
-    before(c);
-    if (culled(c))
-        return;
-    oldDI(c, n, s, b);
+    if (!skipDraw(c))
+        oldDI(c, n, s, b);
 }
 static void STDMETHODCALLTYPE draw(ID3D11DeviceContext *c, UINT n, UINT s) {
-    before(c);
-    if (culled(c))
-        return;
-    oldD(c, n, s);
+    if (!skipDraw(c))
+        oldD(c, n, s);
 }
 // Map/Unmap/Update: remember writes to 64-byte constant buffers.
 static HRESULT STDMETHODCALLTYPE map(ID3D11DeviceContext *c, ID3D11Resource *r, UINT sub,
@@ -687,7 +707,7 @@ static HRESULT STDMETHODCALLTYPE map(ID3D11DeviceContext *c, ID3D11Resource *r, 
     return hr;
 }
 static void STDMETHODCALLTYPE unmap(ID3D11DeviceContext *c, ID3D11Resource *r, UINT sub) {
-    auto it = mapped.find(r);
+    auto it = mapped.empty() ? mapped.end() : mapped.find(r);
     if (it != mapped.end()) {
         r->SetPrivateData(cacheGuid, it->second.size, it->second.data);
         mapped.erase(it);
